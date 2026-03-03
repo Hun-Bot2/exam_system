@@ -1,0 +1,16 @@
+# Core dependencies
+streamlit==1.32.0
+pandas>=2.2.1
+python-dotenv==1.0.1
+openai>=1.14.0
+
+# ML/AI dependencies
+torch>=2.9.0
+torch-geometric>=2.6.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+
+# Visualization
+matplotlib>=3.8.0
+plotly>=5.19.0
+networkx>=3.2.0
