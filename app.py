@@ -6,461 +6,589 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import uuid
-from api import generate_questions_via_api
-from gnn_model import DifficultyPredictor  # GNN 모델 import
 
-APP_TITLE = "정보교과 시험 문제 출제 시스템"
-STEP_FLOW = ["login", "setup", "generate", "solve", "feedback", "complete"]
-STEP_LABELS = {
-    "login": "학생 인증",
-    "setup": "조건 설정",
-    "generate": "문제 생성",
-    "solve": "문제 풀이",
-    "feedback": "피드백 작성",
-    "complete": "완료"
-}
+# ── 페이지 설정 (반드시 첫 번째 st.* 호출) ──────────────────────────────────
+st.set_page_config(
+    page_title="정보교과 AI 시험",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+from styles import inject_css, hero, section, badge, step_indicator, difficulty_badge
+inject_css()
+
+from api import generate_questions_via_api
+from gnn_model import DifficultyPredictor
+
+# ── 상수 ──────────────────────────────────────────────────────────────────────
+APP_TITLE = "정보교과 AI 시험 시스템"
+STEP_FLOW  = ["login", "setup", "generate", "solve", "feedback", "complete"]
+STEP_LABELS = ["학생 인증", "조건 설정", "문제 생성", "문제 풀이", "피드백", "완료"]
 FEEDBACK_FILE = Path("data_files/feedback/feedback.csv")
 
-# 페이지 설정
-st.set_page_config(page_title=APP_TITLE, layout="wide")
 
+# ── GNN 모델 ─────────────────────────────────────────────────────────────────
 
-def render_app_header(subtitle: Optional[str] = None, show_student_id: bool = True) -> None:
-    """공통 페이지 헤더와 단계 진행 상황을 렌더링."""
-    st.title(APP_TITLE)
-    st.caption("AI 기반 개인 맞춤 문제 생성 시스템")
-    render_step_indicator()
-
-    if show_student_id and st.session_state.get("student_id"):
-        st.markdown(f"**학번:** {st.session_state.student_id}")
-
-    if subtitle:
-        st.header(subtitle)
-
-
-def render_step_indicator() -> None:
-    """현재 단계 진행 상황을 한눈에 보여주는 배지 표시."""
-    current_step = st.session_state.get("step", STEP_FLOW[0])
-    current_idx = STEP_FLOW.index(current_step)
-    badges = []
-    for idx, step in enumerate(STEP_FLOW):
-        icon = "[완료]" if idx < current_idx else ("[진행중]" if idx == current_idx else "[대기]")
-        badges.append(f"{icon} {STEP_LABELS[step]}")
-    st.caption(" / ".join(badges))
-
-# GNN 모델 초기화
 @st.cache_resource
 def load_gnn_model():
-    """캐싱된 GNN 난이도 예측기 로드."""
     return DifficultyPredictor()
 
 
+# ── 세션 초기화 ───────────────────────────────────────────────────────────────
+
 def initialize_session_state():
-    """Streamlit 세션 상태 기본값을 구성."""
-    if 'session_id' not in st.session_state:
-        st.session_state.session_id = str(uuid.uuid4())
-    
-    if 'step' not in st.session_state:
-        st.session_state.step = 'login'  # login -> setup -> generate -> solve -> feedback
-    
-    if 'student_id' not in st.session_state:
-        st.session_state.student_id = ""
-        
-    if 'questions' not in st.session_state:
-        st.session_state.questions = []
-        
-    if 'current_question_index' not in st.session_state:
-        st.session_state.current_question_index = 0
-        
-    if 'answers' not in st.session_state:
-        st.session_state.answers = {}
-        
-    if 'feedback_data' not in st.session_state:
-        st.session_state.feedback_data = []
-        
-    if 'gnn_model' not in st.session_state:
-        st.session_state.gnn_model = load_gnn_model()
+    defaults = {
+        "session_id": str(uuid.uuid4()),
+        "step": "login",
+        "student_id": "",
+        "questions": [],
+        "current_question_index": 0,
+        "answers": {},
+        "feedback_data": [],
+        "gnn_model": load_gnn_model(),
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
 
 initialize_session_state()
 
-def save_feedback(feedback_data):
-    """피드백 CSV를 갱신하고 GNN 프로토타입에 학습 데이터를 푸시."""
-    FEEDBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+# ── 공통 헤더 ─────────────────────────────────────────────────────────────────
+
+def render_step_header():
+    """현재 단계에 맞는 진행 상태 표시기를 렌더링."""
+    current_idx = STEP_FLOW.index(st.session_state.get("step", "login"))
+    step_indicator(STEP_LABELS, current_idx)
+
+    if st.session_state.get("student_id"):
+        st.markdown(
+            f'<p style="color:#94A3B8;font-size:0.82rem;margin:-0.5rem 0 1rem;">'
+            f'학번 <strong style="color:#F8FAFC">{st.session_state.student_id}</strong> '
+            f'&nbsp;·&nbsp; 세션 {st.session_state.session_id[:8]}</p>',
+            unsafe_allow_html=True,
+        )
+
+
+# ── 피드백 저장 ───────────────────────────────────────────────────────────────
+
+def save_feedback(feedback_data):
+    FEEDBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
         df = pd.read_csv(FEEDBACK_FILE)
     except FileNotFoundError:
         df = pd.DataFrame(columns=[
-            'timestamp', 'session_id', 'student_id', 'school_type',
-            'question_id', 'question', 'student_answer', 'correct_answer',
-            'difficulty_rating', 'comment', 'unit', 'difficulty'
+            "timestamp", "session_id", "student_id", "school_type",
+            "question_id", "question", "student_answer", "correct_answer",
+            "difficulty_rating", "comment", "unit", "difficulty",
         ])
-
     df = pd.concat([df, pd.DataFrame([feedback_data])], ignore_index=True)
     df.to_csv(FEEDBACK_FILE, index=False)
 
-    # 피드백을 즉시 학습 데이터에 반영하여 모델 개선 루프를 시뮬레이션한다.
     try:
         current_question = st.session_state.questions[st.session_state.current_question_index]
         features = {
-            'question': feedback_data['question'],
-            'options': current_question['options'],
-            'unit': feedback_data['unit']
+            "question": feedback_data["question"],
+            "options": current_question["options"],
+            "unit": feedback_data["unit"],
         }
-        st.session_state.gnn_model.update_training_data(features, feedback_data['difficulty_rating'])
-    except Exception as exc:  # 모델 개발 단계에서는 경고만 노출
+        st.session_state.gnn_model.update_training_data(features, feedback_data["difficulty_rating"])
+    except Exception as exc:
         st.warning(f"GNN 모델 업데이트 중 오류가 발생했습니다: {exc}")
 
-# 1단계: 학번 입력
+
+# ── Step 1: 로그인 ─────────────────────────────────────────────────────────────
+
 def show_login_step():
-    """학생 식별 정보 입력 단계."""
-    render_app_header("학생 정보 입력", show_student_id=False)
-    st.markdown("---")
+    hero("🎓", "정보교과 AI 시험 시스템", "AI가 실시간으로 생성하는 개인 맞춤형 문제")
 
-    student_id = st.text_input(
-        "학번을 입력하세요:", 
-        value=st.session_state.student_id,
-        placeholder="예: 2024001"
-    )
-    
-    if student_id:
-        st.session_state.student_id = student_id
-        
-        if st.button("다음 단계로 진행", type="primary"):
-            st.session_state.step = 'setup'
-            st.rerun()
-    else:
-        st.info("학번을 입력해주세요.")
-
-# 2단계: 문제 생성 조건 설정
-def show_setup_step():
-    """학생이 시험 조건(난이도, 문항 수 등)을 선택하는 단계."""
-    render_app_header("⚙️ 문제 생성 조건 설정")
-    st.markdown("---")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("난이도 선택")
-        difficulty = st.radio(
-            "원하는 난이도를 선택하세요",
-            options=["하", "중", "상"],
-            help="하: 기초 수준, 중: 보통 수준, 상: 고급 수준"
+    # 중앙 정렬 로그인 카드
+    _, col, _ = st.columns([1, 1.4, 1])
+    with col:
+        st.markdown('<div class="ex-card">', unsafe_allow_html=True)
+        st.markdown(
+            '<p style="font-size:0.78rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.5rem;">학번 입력</p>',
+            unsafe_allow_html=True,
         )
-        
-    with col2:
-        st.subheader("문제 개수")
+        student_id = st.text_input(
+            "학번",
+            value=st.session_state.student_id,
+            placeholder="예: 2024001",
+            label_visibility="collapsed",
+        )
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        btn = st.button("시험 시작하기", type="primary", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if btn:
+            if student_id.strip():
+                st.session_state.student_id = student_id.strip()
+                st.session_state.step = "setup"
+                st.rerun()
+            else:
+                st.error("학번을 입력해주세요.")
+
+    # 하단 안내
+    st.markdown(
+        '<p style="text-align:center;color:#475569;font-size:0.8rem;margin-top:1.5rem;">'
+        '입력한 학번은 성적 기록 및 AI 모델 개선에만 사용됩니다.</p>',
+        unsafe_allow_html=True,
+    )
+
+
+# ── Step 2: 설정 ──────────────────────────────────────────────────────────────
+
+def show_setup_step():
+    render_step_header()
+    section("조건 설정", "시험 유형과 난이도를 선택하세요")
+
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        st.markdown(
+            '<p style="font-size:0.78rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.4rem;">학교 유형</p>',
+            unsafe_allow_html=True,
+        )
+        school_type = st.selectbox(
+            "학교 유형",
+            ["중학교", "고등학교", "소프트웨어 고등학교"],
+            label_visibility="collapsed",
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(
+            '<p style="font-size:0.78rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.4rem;">난이도</p>',
+            unsafe_allow_html=True,
+        )
+        difficulty = st.radio(
+            "난이도",
+            ["하", "중", "상"],
+            horizontal=False,
+            label_visibility="collapsed",
+            captions=["기초 개념 위주", "응용 및 이해", "심화 분석"],
+        )
+
+    with col_r:
+        st.markdown(
+            '<p style="font-size:0.78rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.4rem;">문제 개수</p>',
+            unsafe_allow_html=True,
+        )
         num_questions = st.slider(
-            "생성할 문제 개수를 선택하세요",
+            "문제 개수",
             min_value=3,
             max_value=10,
             step=1,
-            value=5
+            value=5,
+            label_visibility="collapsed",
         )
-        st.caption("※ 무료 API 키는 5개 이하를 권장합니다.")
-    
-    st.subheader("학교 유형")
-    school_type = st.selectbox(
-        "해당하는 학교 유형을 선택하세요",
-        options=["중학교", "고등학교", "소프트웨어 고등학교"],
-        help="학교 유형에 따라 문제의 수준과 내용이 조정됩니다"
-    )
-    
-    st.markdown("---")
-    
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("이전 단계", type="secondary"):
-            st.session_state.step = 'login'
+
+        # 미리보기 카드
+        diff_badge = difficulty_badge(difficulty)
+        school_badges = {
+            "중학교": badge("중학교", "p"),
+            "고등학교": badge("고등학교", "p"),
+            "소프트웨어 고등학교": badge("SW고", "p"),
+        }
+        st.markdown(f"""
+        <div class="ex-card" style="margin-top:1.5rem;">
+            <p style="font-size:0.7rem;font-weight:700;text-transform:uppercase;
+                      letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.85rem;">선택 요약</p>
+            <div class="ex-info-grid">
+                <div class="ex-info-row">
+                    <span class="ex-il">학교 유형</span>
+                    <span class="ex-iv">{school_badges[school_type]}</span>
+                </div>
+                <div class="ex-info-row">
+                    <span class="ex-il">난이도</span>
+                    <span class="ex-iv">{diff_badge}</span>
+                </div>
+                <div class="ex-info-row">
+                    <span class="ex-il">문제 수</span>
+                    <span class="ex-iv">{num_questions}문항</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption("무료 API 사용 시 5문항 이하 권장")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_back, _, col_next = st.columns([1, 2, 1])
+    with col_back:
+        if st.button("← 이전", type="secondary", use_container_width=True):
+            st.session_state.step = "login"
             st.rerun()
-    
-    with col2:
-        if st.button("문제 생성하기", type="primary"):
-            # 문제 생성 시작
+    with col_next:
+        if st.button("문제 생성하기 →", type="primary", use_container_width=True):
             st.session_state.difficulty = difficulty
             st.session_state.num_questions = num_questions
             st.session_state.school_type = school_type
-            st.session_state.step = 'generate'
+            st.session_state.step = "generate"
             st.rerun()
 
-# 3단계: 문제 생성
-def show_generate_step():
-    """OpenAI 및 GNN을 사용해 맞춤 문제 세트를 구성."""
-    render_app_header("AI 문제 생성 중")
-    st.markdown("---")
-    
-    # 설정 정보 표시
-    st.info(f"""
-    **생성 조건**
-    - 학교 유형: {st.session_state.school_type}
-    - 난이도: {st.session_state.difficulty}
-    - 문제 개수: {st.session_state.num_questions}개
-    """)
-    
-    # 문제가 아직 생성되지 않았다면 생성
-    if not st.session_state.questions:
-        questions = generate_questions_via_api(
-            st.session_state.difficulty,
-            st.session_state.num_questions,
-            st.session_state.school_type
-        )
-        
-        if questions:
-            # GNN 모델을 사용하여 각 문제의 난이도 예측
-            difficulty_order = {'하': 0, '중': 1, '상': 2}
-            for question in questions:
-                predicted_difficulty = st.session_state.gnn_model.predict_difficulty(
-                    question['question'],
-                    question['options'],
-                    question['unit']
-                )
-                question['predicted_difficulty'] = predicted_difficulty
 
-            # 예측된 난이도에 따라 문제 정렬 (하→중→상)
-            questions.sort(key=lambda x: difficulty_order.get(x['predicted_difficulty'], 1))
-            
+# ── Step 3: 문제 생성 ─────────────────────────────────────────────────────────
+
+def show_generate_step():
+    render_step_header()
+    section("AI 문제 생성", "선택한 조건으로 맞춤 문제를 생성합니다")
+
+    school_type  = st.session_state.school_type
+    difficulty   = st.session_state.difficulty
+    num_questions = st.session_state.num_questions
+
+    diff_badge = difficulty_badge(difficulty)
+    school_map = {"중학교": badge("중학교", "p"), "고등학교": badge("고등학교", "p"),
+                  "소프트웨어 고등학교": badge("SW고", "p")}
+    st.markdown(f"""
+    <div class="ex-card-accent">
+        <div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;">
+            {school_map[school_type]}
+            {diff_badge}
+            <span class="ex-badge ex-badge-mt">{num_questions}문항</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if not st.session_state.questions:
+        questions = generate_questions_via_api(difficulty, num_questions, school_type)
+
+        if questions:
+            difficulty_order = {"하": 0, "중": 1, "상": 2}
+            for q in questions:
+                q["predicted_difficulty"] = st.session_state.gnn_model.predict_difficulty(
+                    q["question"], q["options"], q["unit"]
+                )
+            questions.sort(key=lambda x: difficulty_order.get(x["predicted_difficulty"], 1))
             st.session_state.questions = questions
-            st.success(f"{len(questions)}개의 문제가 성공적으로 생성되었습니다.")
-            
-            # 난이도 분포 시각화
-            difficulty_distribution = pd.DataFrame([
-                {'predicted_difficulty': q['predicted_difficulty']} for q in questions
-            ])
-            
-            st.subheader("예측된 난이도 분포")
-            st.bar_chart(difficulty_distribution['predicted_difficulty'].value_counts())
-            
-            if st.button("문제 풀이 시작하기", type="primary"):
-                st.session_state.step = 'solve'
+
+            # 성공 배너
+            st.markdown(f"""
+            <div class="ex-card-ok">
+                <strong style="color:#34D399">✓ {len(questions)}개 문제 생성 완료</strong>
+                <p style="margin:0.35rem 0 0;font-size:0.85rem;color:#94A3B8;">
+                    GNN 모델이 난이도를 예측하여 순서를 조정했습니다.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # 난이도 분포
+            section("예측 난이도 분포")
+            dist = pd.DataFrame([{"난이도": q["predicted_difficulty"]} for q in questions])
+            counts = dist["난이도"].value_counts().reindex(["하", "중", "상"], fill_value=0)
+            st.bar_chart(counts)
+
+            if st.button("문제 풀이 시작하기 →", type="primary"):
+                st.session_state.step = "solve"
                 st.rerun()
         else:
-            st.error("문제 생성에 실패했습니다. 다시 시도해주세요.")
+            st.markdown("""
+            <div class="ex-card-er">
+                <strong style="color:#F87171">문제 생성에 실패했습니다.</strong>
+                <p style="margin:0.35rem 0 0;font-size:0.85rem;color:#94A3B8;">
+                    API 키와 네트워크 연결을 확인한 뒤 다시 시도해주세요.
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
             if st.button("다시 시도"):
                 st.rerun()
     else:
-        st.success(f"{len(st.session_state.questions)}개의 문제가 준비되었습니다.")
-        if st.button("문제 풀이 시작하기", type="primary"):
-            st.session_state.step = 'solve'
+        st.markdown(f"""
+        <div class="ex-card-ok">
+            <strong style="color:#34D399">✓ {len(st.session_state.questions)}개 문제 준비됨</strong>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("문제 풀이 시작하기 →", type="primary"):
+            st.session_state.step = "solve"
             st.rerun()
 
-# 4단계: 문제 풀이
-def show_solve_step():
-    """학생이 문제를 순차적으로 풀이하는 화면."""
-    render_app_header("문제 풀이 진행 중")
 
-    current_idx = st.session_state.current_question_index
-    total_questions = len(st.session_state.questions)
-    current_question = st.session_state.questions[current_idx]
-    
-    # 진행률 표시
-    progress = (current_idx + 1) / total_questions
+# ── Step 4: 풀이 ──────────────────────────────────────────────────────────────
+
+def show_solve_step():
+    render_step_header()
+
+    current_idx    = st.session_state.current_question_index
+    total          = len(st.session_state.questions)
+    q              = st.session_state.questions[current_idx]
+
+    # 진행 표시
+    progress = (current_idx + 1) / total
     st.progress(progress)
-    st.markdown(f"**진행률:** {current_idx + 1}/{total_questions} 문제")
-    
-    st.markdown("---")
-    
-    # 문제 표시
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.header(f"문제 {current_idx + 1}")
-        st.markdown(f"**단원:** {current_question['unit']}")
-        st.markdown(f"**난이도:** {current_question['difficulty']}")
-        st.markdown("---")
-        
-        st.markdown(f"### {current_question['question']}")
-        
-        # 객관식 선택지
+    st.markdown(
+        f'<p style="font-size:0.8rem;color:#94A3B8;margin:-0.25rem 0 1.25rem;">'
+        f'<strong style="color:#F8FAFC">{current_idx + 1}</strong> / {total} 문항 &nbsp;·&nbsp; '
+        f'{progress * 100:.0f}% 완료</p>',
+        unsafe_allow_html=True,
+    )
+
+    col_q, col_info = st.columns([2.2, 1], gap="large")
+
+    with col_q:
+        diff_b = difficulty_badge(q["difficulty"])
+        st.markdown(f"""
+        <div class="ex-card">
+            <div class="ex-q-meta">
+                <span>Q{current_idx + 1}</span>
+                <span>{q["unit"]}</span>
+            </div>
+            <div style="margin-bottom:0.5rem;">{diff_b}</div>
+            <div class="ex-q-text">{q["question"]}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
         answer_key = f"answer_{current_idx}"
-        selected_answer = st.radio(
-            "정답을 선택하세요:",
-            options=current_question['options'],
-            key=answer_key
+        selected = st.radio(
+            "정답 선택",
+            options=q["options"],
+            key=answer_key,
+            label_visibility="collapsed",
         )
-        
-        # 답안 저장
-        st.session_state.answers[current_idx] = selected_answer
-    
-    with col2:
-        st.markdown("### 문제 정보")
-        st.info(f"""
-        **현재 문제:** {current_idx + 1}번
-        **총 문제 수:** {total_questions}개
-        **완료율:** {((current_idx + 1) / total_questions * 100):.1f}%
-        """)
-        
-        # 네비게이션 버튼
-        st.markdown("---")
-        
+        st.session_state.answers[current_idx] = selected
+
+    with col_info:
+        st.markdown(f"""
+        <div class="ex-card">
+            <p style="font-size:0.7rem;font-weight:700;text-transform:uppercase;
+                      letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.75rem;">문제 정보</p>
+            <div class="ex-info-grid">
+                <div class="ex-info-row">
+                    <span class="ex-il">현재</span>
+                    <span class="ex-iv">{current_idx + 1}번</span>
+                </div>
+                <div class="ex-info-row">
+                    <span class="ex-il">남은 문제</span>
+                    <span class="ex-iv">{total - current_idx - 1}개</span>
+                </div>
+                <div class="ex-info-row">
+                    <span class="ex-il">완료율</span>
+                    <span class="ex-iv">{progress * 100:.0f}%</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
         col_prev, col_next = st.columns(2)
-        
         with col_prev:
             if current_idx > 0:
-                if st.button("⬅️ 이전", type="secondary"):
+                if st.button("← 이전", type="secondary", use_container_width=True):
                     st.session_state.current_question_index -= 1
                     st.rerun()
-        
         with col_next:
-            if current_idx < total_questions - 1:
-                if st.button("다음 ➡️", type="primary"):
+            if current_idx < total - 1:
+                if st.button("다음 →", type="primary", use_container_width=True):
                     st.session_state.current_question_index += 1
                     st.rerun()
             else:
-                if st.button("풀이 완료", type="primary"):
-                    st.session_state.step = 'feedback'
-                    st.session_state.current_question_index = 0  # 피드백용 초기화
+                if st.button("풀이 완료", type="primary", use_container_width=True):
+                    st.session_state.step = "feedback"
+                    st.session_state.current_question_index = 0
                     st.rerun()
 
-# 5단계: 피드백 수집
-def show_feedback_step():
-    """문제별 난이도 평가 및 의견을 수집."""
-    render_app_header("문제 피드백 수집")
-    
-    current_idx = st.session_state.current_question_index
-    total_questions = len(st.session_state.questions)
-    current_question = st.session_state.questions[current_idx]
-    
-    # 진행률 표시
-    progress = (current_idx + 1) / total_questions
-    st.progress(progress)
-    st.markdown(f"**피드백 진행률:** {current_idx + 1}/{total_questions} 문제")
-    
-    st.markdown("---")
-    st.header("문제 피드백")
-    
-    # 문제와 답안 표시
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader(f"문제 {current_idx + 1}")
-        st.markdown(f"**단원:** {current_question['unit']}")
-        st.markdown(f"**문제:** {current_question['question']}")
-        
-        # 학생 답안과 정답 비교
-        student_answer = st.session_state.answers.get(current_idx, "답안 없음")
-        correct_answer = current_question['answer']
-        
-        # 학생 답안의 인덱스 찾기
-        student_answer_idx = current_question['options'].index(student_answer) + 1 if student_answer in current_question['options'] else -1
-        
-        st.markdown("**답안 비교:**")
-        st.write(f"- 내 답안: {student_answer}")
-        st.write(f"- 정답: {current_question['options'][int(correct_answer) - 1]}")
-        
-        if student_answer_idx == int(correct_answer):
-            st.success("정답입니다.")
-        else:
-            st.error("오답입니다.")
-    
-    with col2:
-        st.subheader("난이도 평가")
-        difficulty_rating = st.radio(
-            "이 문제의 난이도는?",
-            options=[1, 2, 3, 4, 5],
-            format_func=lambda x: f"{x}점",
-            key=f"rating_{current_idx}"
-        )
-        
-        st.subheader("의견")
-        comment = st.text_area(
-            "문제에 대한 의견을 남겨주세요",
-            height=100,
-            key=f"comment_{current_idx}"
-        )
-    
-    # 피드백 제출
-    st.markdown("---")
-    
-    col_prev, col_submit = st.columns([1, 1])
-    
-    with col_prev:
-        if current_idx > 0:
-            if st.button("⬅️ 이전 문제", type="secondary"):
-                st.session_state.current_question_index -= 1
-                st.rerun()
-    
-    with col_submit:
-        if st.button("피드백 제출", type="primary"):
-            # 피드백 데이터 저장
-            feedback_data = {
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'session_id': st.session_state.session_id,
-                'student_id': st.session_state.student_id,
-                'school_type': st.session_state.school_type,
-                'question_id': current_question['id'],
-                'question': current_question['question'],
-                'student_answer': st.session_state.answers.get(current_idx, "답안 없음"),
-                'correct_answer': current_question['options'][int(current_question['answer']) - 1],
-                'difficulty_rating': difficulty_rating,
-                'comment': comment,
-                'unit': current_question['unit'],
-                'difficulty': current_question['difficulty']
-            }
-            
-            st.session_state.feedback_data.append(feedback_data)
-            save_feedback(feedback_data)
-            
-            # 다음 문제로 이동 또는 완료
-            if current_idx < total_questions - 1:
-                st.session_state.current_question_index += 1
-                st.success("피드백이 저장되었습니다!")
-                st.rerun()
-            else:
-                # 모든 피드백 완료
-                st.session_state.step = 'complete'
-                st.rerun()
 
-# 6단계: 완료
+# ── Step 5: 피드백 ────────────────────────────────────────────────────────────
+
+def show_feedback_step():
+    render_step_header()
+
+    current_idx = st.session_state.current_question_index
+    total       = len(st.session_state.questions)
+    q           = st.session_state.questions[current_idx]
+
+    st.progress((current_idx + 1) / total)
+    st.markdown(
+        f'<p style="font-size:0.8rem;color:#94A3B8;margin:-0.25rem 0 1.25rem;">'
+        f'피드백 <strong style="color:#F8FAFC">{current_idx + 1}</strong> / {total}</p>',
+        unsafe_allow_html=True,
+    )
+
+    col_q, col_fb = st.columns([2.2, 1], gap="large")
+
+    with col_q:
+        section("문제 및 답안 확인")
+        diff_b = difficulty_badge(q["difficulty"])
+        st.markdown(f"""
+        <div class="ex-card">
+            <div class="ex-q-meta"><span>Q{current_idx + 1}</span><span>{q["unit"]}</span></div>
+            <div style="margin-bottom:0.6rem;">{diff_b}</div>
+            <div class="ex-q-text">{q["question"]}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        student_ans = st.session_state.answers.get(current_idx, "")
+        correct_ans = q["options"][int(q["answer"]) - 1]
+        student_idx = q["options"].index(student_ans) + 1 if student_ans in q["options"] else -1
+        is_correct  = student_idx == int(q["answer"])
+
+        if is_correct:
+            st.markdown(f"""
+            <div class="ex-ans-correct">
+                <div class="ex-ans-icon">✓</div>
+                <div>
+                    <div class="ex-ans-label">정답</div>
+                    <div>{correct_ans}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="ex-ans-wrong">
+                <div class="ex-ans-icon">✗</div>
+                <div>
+                    <div class="ex-ans-label">내 답 (오답)</div>
+                    <div>{student_ans}</div>
+                </div>
+            </div>
+            <div class="ex-ans-correct">
+                <div class="ex-ans-icon">✓</div>
+                <div>
+                    <div class="ex-ans-label">정답</div>
+                    <div>{correct_ans}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col_fb:
+        section("피드백 작성")
+        st.markdown(
+            '<p style="font-size:0.78rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.07em;color:#94A3B8;margin-bottom:0.4rem;">난이도 평가 (1~5)</p>',
+            unsafe_allow_html=True,
+        )
+        difficulty_rating = st.radio(
+            "난이도 평가",
+            [1, 2, 3, 4, 5],
+            format_func=lambda x: ["매우 쉬움", "쉬움", "보통", "어려움", "매우 어려움"][x - 1],
+            key=f"rating_{current_idx}",
+            label_visibility="collapsed",
+        )
+        comment = st.text_area(
+            "의견 (선택)",
+            height=90,
+            key=f"comment_{current_idx}",
+            placeholder="문제에 대한 의견을 남겨주세요.",
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_prev, col_sub = st.columns(2)
+        with col_prev:
+            if current_idx > 0:
+                if st.button("← 이전", type="secondary", use_container_width=True):
+                    st.session_state.current_question_index -= 1
+                    st.rerun()
+        with col_sub:
+            if st.button("제출 →", type="primary", use_container_width=True):
+                feedback_data = {
+                    "timestamp":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "session_id":      st.session_state.session_id,
+                    "student_id":      st.session_state.student_id,
+                    "school_type":     st.session_state.school_type,
+                    "question_id":     q["id"],
+                    "question":        q["question"],
+                    "student_answer":  student_ans,
+                    "correct_answer":  correct_ans,
+                    "difficulty_rating": difficulty_rating,
+                    "comment":         comment,
+                    "unit":            q["unit"],
+                    "difficulty":      q["difficulty"],
+                }
+                st.session_state.feedback_data.append(feedback_data)
+                save_feedback(feedback_data)
+
+                if current_idx < total - 1:
+                    st.session_state.current_question_index += 1
+                    st.rerun()
+                else:
+                    st.session_state.step = "complete"
+                    st.rerun()
+
+
+# ── Step 6: 완료 ──────────────────────────────────────────────────────────────
+
 def show_complete_step():
-    """시험 결과 요약과 다음 학습 안내."""
-    render_app_header("시험이 완료되었습니다.")
-    st.markdown("---")
-    
+    render_step_header()
     st.balloons()
-    
-    # 결과 요약
-    total_questions = len(st.session_state.questions)
-    correct_answers = sum(1 for i in range(total_questions) 
-                         if st.session_state.answers.get(i) in st.session_state.questions[i]['options'] and 
-                         st.session_state.questions[i]['options'].index(st.session_state.answers.get(i)) + 1 == int(st.session_state.questions[i]['answer']))
-    
+
+    total = len(st.session_state.questions)
+    correct = sum(
+        1 for i in range(total)
+        if (ans := st.session_state.answers.get(i)) in st.session_state.questions[i]["options"]
+        and st.session_state.questions[i]["options"].index(ans) + 1
+           == int(st.session_state.questions[i]["answer"])
+    )
+    accuracy = correct / total * 100 if total else 0
+
+    # 결과 배너
+    acc_badge = badge("우수", "ok") if accuracy >= 80 else (badge("보통", "wn") if accuracy >= 50 else badge("노력 필요", "er"))
+    st.markdown(f"""
+    <div class="ex-hero" style="margin-bottom:1.5rem;">
+        <div class="ex-hero-icon">🏆</div>
+        <div class="ex-hero-title">시험 완료!</div>
+        <p class="ex-hero-sub">모든 문제를 풀고 피드백을 제출했습니다. {acc_badge}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 핵심 지표
     col1, col2, col3 = st.columns(3)
-    
     with col1:
-        st.metric("총 문제 수", total_questions)
-    
+        st.metric("총 문제 수", total)
     with col2:
-        st.metric("정답 수", correct_answers)
-    
+        st.metric("정답 수", correct)
     with col3:
-        st.metric("정답률", f"{(correct_answers/total_questions*100):.1f}%")
-    
-    st.markdown("---")
-    st.success("모든 피드백이 저장되었습니다. 감사합니다!")
-    st.info("이 데이터는 AI 모델 개선에 활용되어 더 나은 문제를 생성하는데 도움이 됩니다.")
-    
+        st.metric("정답률", f"{accuracy:.1f}%")
+
+    section("문항별 결과")
+    for i, q in enumerate(st.session_state.questions):
+        ans = st.session_state.answers.get(i, "")
+        correct_opt = q["options"][int(q["answer"]) - 1]
+        is_ok = ans in q["options"] and q["options"].index(ans) + 1 == int(q["answer"])
+        status_badge = badge("정답", "ok") if is_ok else badge("오답", "er")
+        diff_b = difficulty_badge(q["difficulty"])
+        st.markdown(f"""
+        <div class="ex-card" style="padding:1rem 1.25rem;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.4rem;">
+                <span style="font-size:0.78rem;font-weight:700;color:#94A3B8;">Q{i+1} · {q["unit"]}</span>
+                <div style="display:flex;gap:0.4rem;">{diff_b} {status_badge}</div>
+            </div>
+            <p style="font-size:0.88rem;color:#F8FAFC;margin:0.3rem 0;">{q["question"]}</p>
+            {"" if is_ok else f'<p style="font-size:0.8rem;color:#F87171;margin:0.2rem 0;">내 답: {ans}</p>'}
+            <p style="font-size:0.8rem;color:#34D399;margin:0.2rem 0;">정답: {correct_opt}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.info("입력하신 피드백은 AI 모델 개선에 활용되어 더 나은 문제를 생성하는 데 도움이 됩니다.")
+
     if st.button("새로운 시험 시작하기", type="primary"):
-        # 세션 초기화
-        for key in ['questions', 'answers', 'feedback_data', 'current_question_index']:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.session_state.step = 'setup'
+        for key in ["questions", "answers", "feedback_data", "current_question_index"]:
+            st.session_state.pop(key, None)
+        st.session_state.step = "setup"
         st.rerun()
 
-# 메인 앱 실행
+
+# ── 라우터 ────────────────────────────────────────────────────────────────────
+
 def main():
-    if st.session_state.step == 'login':
+    step = st.session_state.step
+    if step == "login":
         show_login_step()
-    elif st.session_state.step == 'setup':
+    elif step == "setup":
         show_setup_step()
-    elif st.session_state.step == 'generate':
+    elif step == "generate":
         show_generate_step()
-    elif st.session_state.step == 'solve':
+    elif step == "solve":
         show_solve_step()
-    elif st.session_state.step == 'feedback':
+    elif step == "feedback":
         show_feedback_step()
-    elif st.session_state.step == 'complete':
+    elif step == "complete":
         show_complete_step()
+
 
 if __name__ == "__main__":
     main()
