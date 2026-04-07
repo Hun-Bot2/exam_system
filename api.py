@@ -13,6 +13,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 AI_BACKEND = os.getenv("AI_BACKEND", "gemini").lower()  # "openai" or "gemini"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # 공통 설정
 MAX_TOKENS = 1500
@@ -129,6 +130,20 @@ SCHOOL_CONFIG = {
 }
 
 
+# ------------------------------------------------------------------
+# 캐시 싱글턴 (Streamlit 프로세스 내 모든 세션이 공유)
+# ------------------------------------------------------------------
+
+@st.cache_resource
+def _get_cache():
+    from cache import QuestionCache
+    return QuestionCache(redis_url=REDIS_URL)
+
+
+# ------------------------------------------------------------------
+# 프롬프트 빌더 / 파서
+# ------------------------------------------------------------------
+
 def _build_prompt(student_level: str, num_questions: int, school_type: str, unit: Optional[str]) -> str:
     """OpenAI / Gemini에 전달할 프롬프트 문자열 생성. JSON 파일 형식과 동일한 구조로 생성."""
     config = SCHOOL_CONFIG.get(school_type, SCHOOL_CONFIG["중학교"])
@@ -229,25 +244,37 @@ def _parse_and_validate(content: str, school_type: str, num_questions: int) -> l
     return questions
 
 
+# ------------------------------------------------------------------
+# 백엔드 API 호출 (스피너 없음 — 호출자가 래핑)
+# ------------------------------------------------------------------
+
+def _call_backend_api(prompt: str, school_type: str, num_questions: int) -> list:
+    """AI_BACKEND에 따라 OpenAI 또는 Gemini를 호출. 스피너는 호출자가 관리."""
+    if AI_BACKEND == "openai":
+        if not OPENAI_API_KEY:
+            st.error("OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
+            return []
+        return _generate_via_openai(prompt, school_type, num_questions)
+    else:
+        if not GEMINI_API_KEY:
+            st.error("GEMINI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
+            return []
+        return _generate_via_gemini(prompt, school_type, num_questions)
+
+
 def _generate_via_openai(prompt: str, school_type: str, num_questions: int) -> list:
-    """OpenAI Chat Completions API 호출."""
+    """OpenAI Chat Completions API 호출 (스피너 없음)."""
     import openai
 
     for attempt in range(MAX_RETRIES):
         try:
-            spinner_msg = (
-                f"AI가 문제를 생성하고 있습니다... 재시도 중 ({attempt}/{MAX_RETRIES - 1}) 잠시만 기다려주세요."
-                if attempt > 0
-                else "AI가 문제를 생성하고 있습니다... 잠시만 기다려주세요."
+            client = openai.OpenAI(api_key=OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
             )
-            with st.spinner(spinner_msg):
-                client = openai.OpenAI(api_key=OPENAI_API_KEY)
-                response = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                )
             content = response.choices[0].message.content.strip()
             return _parse_and_validate(content, school_type, num_questions)
 
@@ -276,7 +303,7 @@ def _generate_via_openai(prompt: str, school_type: str, num_questions: int) -> l
 
 
 def _generate_via_gemini(prompt: str, school_type: str, num_questions: int) -> list:
-    """Google Gemini API 호출 (google-genai SDK)."""
+    """Google Gemini API 호출 (스피너 없음)."""
     from google import genai
     from google.genai import types
 
@@ -284,20 +311,14 @@ def _generate_via_gemini(prompt: str, school_type: str, num_questions: int) -> l
 
     for attempt in range(MAX_RETRIES):
         try:
-            spinner_msg = (
-                f"AI가 문제를 생성하고 있습니다... 재시도 중 ({attempt}/{MAX_RETRIES - 1}) 잠시만 기다려주세요."
-                if attempt > 0
-                else "AI가 문제를 생성하고 있습니다... 잠시만 기다려주세요."
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=TEMPERATURE,
+                    max_output_tokens=MAX_TOKENS,
+                ),
             )
-            with st.spinner(spinner_msg):
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=TEMPERATURE,
-                        max_output_tokens=MAX_TOKENS,
-                    ),
-                )
             content = response.text.strip()
             return _parse_and_validate(content, school_type, num_questions)
 
@@ -327,18 +348,87 @@ def _generate_via_gemini(prompt: str, school_type: str, num_questions: int) -> l
     return []
 
 
-def generate_questions_via_api(student_level: str, num_questions: int, school_type: str, unit: Optional[str] = None):
-    """AI API를 호출해 문제를 생성하고 검증. AI_BACKEND 환경변수로 백엔드 선택 (기본값: gemini)."""
-    prompt = _build_prompt(student_level, num_questions, school_type, unit)
+# ------------------------------------------------------------------
+# 풀 보충
+# ------------------------------------------------------------------
 
-    if AI_BACKEND == "openai":
-        if not OPENAI_API_KEY:
-            st.error("OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
-            return []
-        return _generate_via_openai(prompt, school_type, num_questions)
+def _replenish_pool(cache, difficulty: str, school_type: str, unit: Optional[str]) -> None:
+    """풀이 POOL_MIN 미만일 때 POOL_REPLENISH개 문제를 생성해 풀에 추가."""
+    from cache import POOL_REPLENISH
+    prompt = _build_prompt(difficulty, POOL_REPLENISH, school_type, unit)
+    cache.check_and_increment_rate_limit()
+    cache.increment_api_calls()
+    questions = _call_backend_api(prompt, school_type, POOL_REPLENISH)
+    if questions:
+        cache.push_to_pool(school_type, difficulty, unit, questions)
+
+
+# ------------------------------------------------------------------
+# 퍼블릭 API — 3계층 폭포
+# ------------------------------------------------------------------
+
+def generate_questions_via_api(
+    student_level: str,
+    num_questions: int,
+    school_type: str,
+    unit: Optional[str] = None,
+) -> list:
+    """캐시 워터폴(풀 → 코얼레싱 → 직접 API)을 통해 문제를 반환."""
+    cache = _get_cache()
+
+    if cache.is_available():
+        # ── Path A: 풀 히트 ──────────────────────────────────────────
+        questions = cache.serve_from_pool(school_type, student_level, unit, num_questions)
+        if questions:
+            cache.increment_cache_hits()
+            cache.increment_total_served(len(questions))
+            # 풀이 낮아졌으면 보충
+            if cache.needs_replenishment(school_type, student_level, unit):
+                with st.spinner("문제 풀 보충 중..."):
+                    _replenish_pool(cache, student_level, school_type, unit)
+            return questions
+
+        # ── Path B: 캐시 미스 → 코얼레싱 ────────────────────────────
+        prompt = _build_prompt(student_level, num_questions, school_type, unit)
+        prompt_hash = cache._prompt_hash(school_type, student_level, unit, num_questions)
+
+        if cache.try_acquire_leader(prompt_hash):
+            # 리더: 직접 API 호출 후 결과 publish
+            with st.spinner("AI가 문제를 생성하고 있습니다... 잠시만 기다려주세요."):
+                cache.check_and_increment_rate_limit()
+                cache.increment_api_calls()
+                result = _call_backend_api(prompt, school_type, num_questions)
+
+            if result:
+                cache.push_to_pool(school_type, student_level, unit, result)
+                cache.publish_result(prompt_hash, result)
+                cache.increment_total_served(len(result))
+                return result
+            else:
+                cache.publish_failure(prompt_hash)
+                return []
+        else:
+            # 팔로워: 리더 결과를 BLPOP으로 대기
+            with st.spinner("다른 사용자의 생성 완료 대기 중... 잠시만 기다려주세요."):
+                result = cache.wait_for_result(prompt_hash)
+
+            if result:
+                cache.increment_cache_hits()
+                cache.increment_total_served(len(result))
+                return result
+            else:
+                # 타임아웃 또는 리더 실패 → 직접 호출 폴백
+                st.warning("대기 시간이 초과되었습니다. 직접 생성합니다.")
+                with st.spinner("AI가 문제를 생성하고 있습니다... 잠시만 기다려주세요."):
+                    cache.check_and_increment_rate_limit()
+                    cache.increment_api_calls()
+                    fallback = _call_backend_api(prompt, school_type, num_questions)
+                if fallback:
+                    cache.increment_total_served(len(fallback))
+                return fallback
+
     else:
-        # gemini (기본값)
-        if not GEMINI_API_KEY:
-            st.error("GEMINI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
-            return []
-        return _generate_via_gemini(prompt, school_type, num_questions)
+        # ── Path C: Redis 없음 — 원본 동작 ──────────────────────────
+        prompt = _build_prompt(student_level, num_questions, school_type, unit)
+        with st.spinner("AI가 문제를 생성하고 있습니다... 잠시만 기다려주세요."):
+            return _call_backend_api(prompt, school_type, num_questions)
